@@ -7,9 +7,11 @@ python llama.py /data/$llama_model \
                 --mlp_wbits 2 \
                 --true-sequential \
                 --act-order \
-                --groupsize 128 \
                 --parent_dir $llama_model \
-                --exp_name gptq22 \
+                --exp_name gptq82_act_gall \
                 --save packed_model.pt \
                 --seqlen 8192
 
+
+                # --groupsize 128 \
+                # --exp_name gptq82_act_g128 \

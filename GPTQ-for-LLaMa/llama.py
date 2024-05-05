@@ -10,6 +10,7 @@ from utils import find_layers, DEV, set_seed, get_wikitext2, get_ptb, get_c4, ge
 from texttable import Texttable
 
 from datetime import datetime
+import time
 import os
 import csv
 from tqdm import tqdm
@@ -451,6 +452,8 @@ def benchmark(model, input_ids, check=False):
 
 if __name__ == '__main__':
 
+    start_time = time.time()
+
     parser = argparse.ArgumentParser()
 
     parser.add_argument('model', type=str, help='llama model to load')
@@ -459,8 +462,8 @@ if __name__ == '__main__':
     parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration data samples.')
     parser.add_argument('--percdamp', type=float, default=.01, help='Percent of the average Hessian diagonal to use for dampening.')
     parser.add_argument('--nearest', action='store_true', help='Whether to run the RTN baseline.')
-    parser.add_argument('--mlp_wbits', type=int, default=16, choices=[2, 3, 4, 8, 16], help='#bits to use for quantization of mlp; use 16 for evaluating base model.')
     parser.add_argument('--attn_wbits', type=int, default=16, choices=[2, 3, 4, 8, 16], help='#bits to use for quantization of attn; use 16 for evaluating base model.')
+    parser.add_argument('--mlp_wbits', type=int, default=16, choices=[2, 3, 4, 8, 16], help='#bits to use for quantization of mlp; use 16 for evaluating base model.')
     parser.add_argument('--trits', action='store_true', help='Whether to use trits for quantization.')
     parser.add_argument('--groupsize', type=int, default=-1, help='Groupsize to use for quantization; default uses full row.')
     parser.add_argument('--eval', action='store_true', help='evaluate quantized model.')
@@ -490,6 +493,9 @@ if __name__ == '__main__':
     results_dir = os.path.join(results_dir, args.parent_dir)
     args.exp_name = f'{args.exp_name}_'+datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
     exp_dir = os.path.join(results_dir, args.exp_name)
+
+    # print args
+    for k,v in args.__dict__.items(): print(k, ':', v)
 
     if args.layers_dist:
         gpu_dist = [int(x) for x in args.layers_dist.split(':')]
@@ -533,7 +539,9 @@ if __name__ == '__main__':
             ppl = llama_eval(model, testloader, DEV)
             ppls.append(ppl)
 
-        results = [args.parent_dir, args.exp_name, args.attn_wbits, args.mlp_wbits]
+        end_time = time.time()
+        elapsed_time = (end_time - start_time)
+        results = [args.parent_dir, args.exp_name, args.attn_wbits, args.mlp_wbits, elapsed_time]
         results.extend(ppls)
         os.makedirs(results_dir, exist_ok=True)
         csv_file_path = os.path.join(results_dir, 'results.csv')
