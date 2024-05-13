@@ -338,11 +338,11 @@ class QuantLinear(nn.Module):
         intweight = torch.cat(intweight, dim=1)
         intweight = intweight.t().contiguous()
         intweight = intweight.numpy().astype(np.uint32)
-        self.qweight = torch.from_numpy(intweight)
+        self.qweight = torch.from_numpy(intweight.astype(np.int32))
 
         zeros -= 1
         zeros = zeros.numpy().astype(np.uint32)
-        self.qzeros = torch.from_numpy(zeros)
+        self.qzeros = torch.from_numpy(zeros.astype(np.int32))
 
     def forward(self, x):
         out_shape = x.shape[:-1] + (self.outfeatures, )
@@ -360,7 +360,6 @@ def make_quant_linear(module, names, attn_wbits, mlp_wbits, groupsize, name=''):
         if name1 in names:
             delattr(module, attr)
             bits = attn_wbits if 'attn' in name1 else mlp_wbits
-            print(f'in make quant linear, {name1 = }, using {bits = }')
             setattr(module, attr, QuantLinear(bits, groupsize, tmp.in_features, tmp.out_features, tmp.bias is not None))
     for name1, child in module.named_children():
         make_quant_linear(child, names, attn_wbits, mlp_wbits, groupsize, name + '.' + name1 if name != '' else name1)

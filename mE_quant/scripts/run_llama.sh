@@ -9,9 +9,6 @@ python llama.py /data/$llama_model \
                 --act-order \
                 --parent_dir $llama_model \
                 --groupsize 128 \
-                --exp_name gptq82_act_g128 \
+                --exp_name debug_thread \
                 --save packed_model.pt \
                 --seqlen 8192
-
-
-                # --exp_name gptq82_act_gall \

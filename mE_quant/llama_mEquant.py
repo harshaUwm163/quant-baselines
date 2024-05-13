@@ -7,6 +7,8 @@ import quant
 
 from gptq import GPTQ, Observer
 from utils import find_layers, DEV, set_seed, get_wikitext2, get_ptb, get_c4, get_ptb_new, get_c4_new, get_loaders, export_quant_table, gen_conditions
+from me_utils import fp_round, fp_round_error, fi_round, fi_round_error, fp_nmax
+
 from texttable import Texttable
 
 from datetime import datetime
@@ -30,95 +32,100 @@ def get_llama(model, seqlen=8192):
     model.seqlen = seqlen
     return model
 
+def fine_scale_mu(  layer, 
+                    block_size, 
+                    e_bit, 
+                    m_bit,
+                    support_special_values = False,
+                    start_learning_rate = 0.001,
+                    s_eps = 1e-5,
+                    num_epochs = 100,
+                    ridge_lambda = 0.0,
+                    barrier_nu = 0.0
+                  ):
 
-@torch.no_grad()
+    def layer_fp_round_error(   params, 
+                                x, 
+                                e_bit, 
+                                m_bit,
+                                support_special_values,
+                                ridge_lambda,
+                                barrier_nu
+                                ):
+        # depending on the Pytorch broadcasting
+        scale = params[0].expand(-1, x.shape[1], -1)
+        mu = params[0].expand(-1, x.shape[1], -1)
+
+        return torch.mean(fp_round_error(x, scale, mu, e_bit, m_bit, support_special_values, ridge_lambda, barrier_nu))
+
+    w = layer.weight.data.clone()
+    BLOCK = block_size
+
+    b_w = w.reshape((w.shape[0]//BLOCK, BLOCK, w.shape[1]))
+
+    bw_max = torch.max(b_w, axis=1, keepdim=True)[0]
+    bw_min = torch.min(b_w, axis=1, keepdim=True)[0]
+    
+    s = torch.nn.Parameter((bw_max - bw_min) / 2.0 / fp_nmax(e_bit, m_bit, support_special_values))
+    mu = torch.nn.Parameter((bw_max + bw_min) / 2.0)
+    
+    params = [s, mu]
+    optim = torch.optim.Adam(params, lr=start_learning_rate)
+    
+    errs = []
+    for epoch in range(num_epochs):
+        loss = layer_fp_round_error(params, b_w, e_bit, m_bit, support_special_values, ridge_lambda, barrier_nu)
+        optim.zero_grad()
+        loss.backward()
+        optim.step()
+        params[0].data.clamp_(min=s_eps)
+    
+        errs.append(loss.item())
+        print(f'{epoch = }, loss = {loss.item()}')
+
+    final_s, final_mu = s.detach(), mu.detach()
+
+    del params, optim, s, mu
+    torch.cuda.empty_cache()
+
+    return final_s, final_mu
+
 def llama_sequential(model, dataloader, dev):
     print('Starting ...')
 
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
     layers = model.model.layers
 
-    model.model.embed_tokens = model.model.embed_tokens.to(dev)
-    model.model.norm = model.model.norm.to(dev)
-    layers[0] = layers[0].to(dev)
-
-    dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros((args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev)
-    cache = {'i': 0, 'attention_mask': None}
-
-    class Catcher(nn.Module):
-
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-
-        def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp
-            cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
-            raise ValueError
-
-    layers[0] = Catcher(layers[0])
-    for batch in dataloader:
-        try:
-            model(batch[0].to(dev))
-        except ValueError:
-            pass
-    layers[0] = layers[0].module
-
-    layers[0] = layers[0].cpu()
-    model.model.embed_tokens = model.model.embed_tokens.cpu()
-    model.model.norm = model.model.norm.cpu()
-    torch.cuda.empty_cache()
-
-    outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
-
     print('Ready.')
-
-    quantizers = {}
-    observer = Observer()
     for i in range(len(layers)):
 
         print(f'Quantizing layer {i+1}/{len(layers)}..')
-        print('+------------------+--------------+------------+-----------+-------+')
-        print('|       name       | weight_error | fp_inp_SNR | q_inp_SNR | time  |')
-        print('+==================+==============+============+===========+=======+')
 
         layer = layers[i].to(dev)
         full = find_layers(layer)
-        if args.true_sequential:
-            sequential = [['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj'], ['self_attn.o_proj'], ['mlp.up_proj', 'mlp.gate_proj'], ['mlp.down_proj']]
-        else:
-            sequential = [list(full.keys())]
+        
+        sequential = [list(full.keys())]
 
         for names in sequential:
             subset = {n: full[n] for n in names}
             gptq = {}
-            for name in subset:
-                gptq[name] = GPTQ(subset[name], observe=args.observe)
-                wbits = args.attn_wbits if 'attn' in name else args.mlp_wbits
-                gptq[name].quantizer.configure(wbits, perchannel=True, sym=args.sym, mse=False)
-
-            def add_batch(name):
-
-                def tmp(_, inp, out):
-                    gptq[name].add_batch(inp[0].data, out.data)
-
-                return tmp
-
-            handles = []
-            for name in subset:
-                handles.append(subset[name].register_forward_hook(add_batch(name)))
-            for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-            for h in handles:
-                h.remove()
 
             for name in subset:
+                # train the scale and mu
+                fine_scale_mu(layer, args)
+                def fine_scale_mu(  layer, 
+                    block_size, 
+                    e_bit, 
+                    m_bit,
+                    support_special_values = False,
+                    start_learning_rate = 0.001,
+                    s_eps = 1e-5,
+                    num_epochs = 100,
+                    ridge_lambda = 0.0,
+                    barrier_nu = 0.0
+                  ):
+
+                # fake quant the layer with the learned scale and mu
+
                 scale, zero, g_idx, error = gptq[name].fasterquant(percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, name=name)
                 wbits = args.attn_wbits if 'attn' in name else args.mlp_wbits
                 quantizers['model.layers.%d.%s' % (i, name)] = (gptq[name].quantizer.cpu(), scale.cpu(), zero.cpu(), g_idx.cpu(), wbits, args.groupsize)
@@ -459,12 +466,12 @@ if __name__ == '__main__':
     parser.add_argument('dataset', type=str, choices=['wikitext2', 'ptb', 'c4'], help='Where to extract calibration data from.')
     parser.add_argument('--seed', type=int, default=0, help='Seed for sampling the calibration data.')
     parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration data samples.')
-    parser.add_argument('--percdamp', type=float, default=.01, help='Percent of the average Hessian diagonal to use for dampening.')
-    parser.add_argument('--nearest', action='store_true', help='Whether to run the RTN baseline.')
-    parser.add_argument('--attn_wbits', type=int, default=16, choices=[2, 3, 4, 8, 16], help='#bits to use for quantization of attn; use 16 for evaluating base model.')
-    parser.add_argument('--mlp_wbits', type=int, default=16, choices=[2, 3, 4, 8, 16], help='#bits to use for quantization of mlp; use 16 for evaluating base model.')
-    parser.add_argument('--trits', action='store_true', help='Whether to use trits for quantization.')
-    parser.add_argument('--groupsize', type=int, default=-1, help='Groupsize to use for quantization; default uses full row.')
+    parser.add_argument('--attn_m', type=int, default=8, help='mantissa bits for attn')
+    parser.add_argument('--attn_e', type=int, default=0, help='exponent bist for attn')
+    parser.add_argument('--mlp_m', type=int, default=2, help='mantissa bits for mlp')
+    parser.add_argument('--mlp_e', type=int, default=0, help='exponent bits for mlp')
+
+    parser.add_argument('--block_size', type=int, default=128, help='block size for the quantization')
     parser.add_argument('--eval', action='store_true', help='evaluate quantized model.')
     parser.add_argument('--test-generation', action='store_true', help='test generation.')
     parser.add_argument('--save', type=str, default='', help='Save quantized checkpoint under this name.')
@@ -473,14 +480,8 @@ if __name__ == '__main__':
     parser.add_argument('--benchmark', type=int, default=0, help='Number of tokens to use for benchmarking.')
     parser.add_argument('--check', action='store_true', help='Whether to compute perplexity during benchmarking for verification.')
     parser.add_argument('--sym', action='store_true', help='Whether to perform symmetric quantization.')
-    parser.add_argument('--act-order', action='store_true', help='Whether to apply the activation order GPTQ heuristic')
-    parser.add_argument('--true-sequential', action='store_true', help='Whether to run in true sequential model.')
     parser.add_argument('--new-eval', action='store_true', help='Whether to use the new PTB and C4 eval')
-    parser.add_argument('--layers-dist', type=str, default='', help='Distribution of layers across GPUs. e.g. 2:1:1 for 2 layers on GPU 0, 1 layer on GPU 1, and 1 layer on GPU 2. Any remaining layers will be assigned to your last GPU.')
-    parser.add_argument('--observe',
-                        action='store_true',
-                        help='Auto upgrade layer precision to higher precision, for example int2 to int4, groupsize 128 to 64. \
-            When this feature enabled, `--save` or `--save_safetensors` would be disable.')
+
     parser.add_argument('--quant-directory', type=str, default=None, help='Specify the directory for export quantization parameters to toml format. `None` means no export by default.')
     parser.add_argument('--exp_name', type=str, default='debug_thread', help='name of the eperiment')
     parser.add_argument('--parent_dir', type=str, default='llama3-8B', help='parent directory to store the results')
@@ -496,21 +497,19 @@ if __name__ == '__main__':
     # print args
     for k,v in args.__dict__.items(): print(k, ':', v)
 
-    if args.layers_dist:
-        gpu_dist = [int(x) for x in args.layers_dist.split(':')]
-    else:
-        gpu_dist = []
+    DEV = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
     if type(args.load) is not str:
         args.load = args.load.as_posix()
 
     if args.load:
+        # TODO-ahv: needs fixing
         model = load_quant(args.model, args.load, args.attn_wbits, args.mlp_wbits, args.groupsize, seqlen=args.seqlen)
     else:
         model = get_llama(args.model, seqlen=args.seqlen)
         model.eval()
 
-    if not args.load and (args.mlp_wbits < 16 or args.attn_wbits < 16) and not args.nearest:
+    if not args.load and (args.attn_m < 16 or args.mlp_m < 16):
         dataloader, testloader = get_loaders(args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen)
 
         tick = time.time()
