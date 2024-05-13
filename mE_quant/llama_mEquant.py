@@ -3,11 +3,9 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-import quant
 
-from gptq import GPTQ, Observer
-from utils import find_layers, DEV, set_seed, get_wikitext2, get_ptb, get_c4, get_ptb_new, get_c4_new, get_loaders, export_quant_table, gen_conditions
-from me_utils import fp_round, fp_round_error, fi_round, fi_round_error, fp_nmax
+from utils import find_layers, DEV, set_seed, get_loaders, export_quant_table
+from me_utils import fp_round, fp_round_error, fi_round, fi_round_error, fp_nmax, fi_max
 
 from texttable import Texttable
 
@@ -32,10 +30,11 @@ def get_llama(model, seqlen=8192):
     model.seqlen = seqlen
     return model
 
-def fine_scale_mu(  layer, 
-                    block_size, 
+def find_scale_mu_fp(  layer, 
+                    name,   
                     e_bit, 
                     m_bit,
+                    block_size, 
                     support_special_values = False,
                     start_learning_rate = 0.001,
                     s_eps = 1e-5,
@@ -54,7 +53,7 @@ def fine_scale_mu(  layer,
                                 ):
         # depending on the Pytorch broadcasting
         scale = params[0].expand(-1, x.shape[1], -1)
-        mu = params[0].expand(-1, x.shape[1], -1)
+        mu = params[1].expand(-1, x.shape[1], -1)
 
         return torch.mean(fp_round_error(x, scale, mu, e_bit, m_bit, support_special_values, ridge_lambda, barrier_nu))
 
@@ -73,7 +72,8 @@ def fine_scale_mu(  layer,
     optim = torch.optim.Adam(params, lr=start_learning_rate)
     
     errs = []
-    for epoch in range(num_epochs):
+    pbar = tqdm(range(num_epochs))
+    for epoch in pbar:
         loss = layer_fp_round_error(params, b_w, e_bit, m_bit, support_special_values, ridge_lambda, barrier_nu)
         optim.zero_grad()
         loss.backward()
@@ -81,7 +81,7 @@ def fine_scale_mu(  layer,
         params[0].data.clamp_(min=s_eps)
     
         errs.append(loss.item())
-        print(f'{epoch = }, loss = {loss.item()}')
+        pbar.set_description(f'{name}, loss = {loss.item():.5f}')
 
     final_s, final_mu = s.detach(), mu.detach()
 
@@ -90,12 +90,72 @@ def fine_scale_mu(  layer,
 
     return final_s, final_mu
 
-def llama_sequential(model, dataloader, dev):
+def find_scale_mu_fi(  layer, 
+                    name,
+                    m_bit,
+                    block_size, 
+                    start_learning_rate = 0.001,
+                    s_eps = 1e-5,
+                    num_epochs = 100,
+                    ridge_lambda = 0.0,
+                    barrier_nu = 0.0
+                  ):
+
+    def layer_fi_round_error(   params, 
+                                x, 
+                                m_bit,
+                                ridge_lambda,
+                                barrier_nu
+                                ):
+        scale = params[0].expand(-1, x.shape[1], -1)
+        mu = params[1].expand(-1, x.shape[1], -1)
+
+        return torch.mean(fi_round_error(x, scale, mu, m_bit, ridge_lambda, barrier_nu))
+
+    w = layer.weight.data.clone()
+    BLOCK = block_size
+
+    b_w = w.reshape((w.shape[0]//BLOCK, BLOCK, w.shape[1]))
+
+    bw_max = torch.max(b_w, axis=1, keepdim=True)[0]
+    bw_min = torch.min(b_w, axis=1, keepdim=True)[0]
+    
+    s = torch.nn.Parameter((bw_max - bw_min) / 2.0 / fi_max(m_bit))
+    mu = torch.nn.Parameter((bw_max + bw_min) / 2.0)
+    
+    params = [s, mu]
+    optim = torch.optim.Adam(params, lr=start_learning_rate)
+    
+    errs = []
+
+    pbar = tqdm(range(num_epochs))
+    for epoch in pbar:
+        loss = layer_fi_round_error(params, b_w, m_bit, ridge_lambda, barrier_nu)
+        optim.zero_grad()
+        loss.backward()
+        optim.step()
+        params[0].data.clamp_(min=s_eps)
+    
+        errs.append(loss.item())
+        pbar.set_description(f'{name}, loss = {loss.item():.5f}')
+
+    final_s, final_mu = s.detach(), mu.detach()
+
+    del params, optim, s, mu
+    torch.cuda.empty_cache()
+
+    return final_s, final_mu
+
+
+
+def llama_sequential(model, dev):
     print('Starting ...')
 
     layers = model.model.layers
 
     print('Ready.')
+    quantizers = {}
+
     for i in range(len(layers)):
 
         print(f'Quantizing layer {i+1}/{len(layers)}..')
@@ -110,81 +170,70 @@ def llama_sequential(model, dataloader, dev):
             gptq = {}
 
             for name in subset:
+                if 'attn' in name:
+                    e_bit, m_bit = args.attn_e, args.attn_m
+                else:
+                    e_bit, m_bit = args.mlp_e, args.mlp_m
+                    
                 # train the scale and mu
-                fine_scale_mu(layer, args)
-                def fine_scale_mu(  layer, 
-                    block_size, 
-                    e_bit, 
-                    m_bit,
-                    support_special_values = False,
-                    start_learning_rate = 0.001,
-                    s_eps = 1e-5,
-                    num_epochs = 100,
-                    ridge_lambda = 0.0,
-                    barrier_nu = 0.0
-                  ):
+                # s, mu = find_scale_mu_fp(  subset[name],
+                #                         name,
+                #                         e_bit, 
+                #                         m_bit,
+                #                         args.block_size, 
+                #                         support_special_values=args.support_special_values,
+                #                         start_learning_rate = args.start_learning_rate,
+                #                         s_eps = args.s_eps,
+                #                         num_epochs = args.num_epochs,
+                #                         ridge_lambda = args.ridge_lambda,
+                #                         barrier_nu = args.barrier_nu
+                #                     )
+                dtype = subset[name].weight.data.type()
+                s, mu = find_scale_mu_fi(   subset[name].type(torch.float32), 
+                                            name,
+                                            m_bit,
+                                            args.block_size, 
+                                            start_learning_rate = args.start_learning_rate,
+                                            s_eps = args.s_eps,
+                                            num_epochs = args.num_epochs,
+                                            ridge_lambda = args.ridge_lambda,
+                                            barrier_nu = args.barrier_nu
+                                        )
 
                 # fake quant the layer with the learned scale and mu
+                with torch.no_grad():
 
-                scale, zero, g_idx, error = gptq[name].fasterquant(percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, name=name)
-                wbits = args.attn_wbits if 'attn' in name else args.mlp_wbits
-                quantizers['model.layers.%d.%s' % (i, name)] = (gptq[name].quantizer.cpu(), scale.cpu(), zero.cpu(), g_idx.cpu(), wbits, args.groupsize)
+                    w = subset[name].weight.data.clone().type(torch.float32)
+                    BLOCK = args.block_size
+                    b_w = w.reshape((w.shape[0]//BLOCK, BLOCK, w.shape[1]))
 
-                if args.observe:
-                    observer.submit(name=name, layerid=i, gptq=gptq[name], error=error)
-                else:
-                    gptq[name].free()
+                    # q_w = fp_round(     b_w,
+                    #                     s.expand(-1, b_w.shape[1], -1),
+                    #                     mu.expand(-1, b_w.shape[1], -1),
+                    #                     e_bit,
+                    #                     m_bit,
+                    #                     support_special_values=args.support_special_values)
+                    q_w = fi_round( b_w, 
+                                    s,
+                                    mu,
+                                    m_bit,
+                                    )
 
-        for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                    subset[name].weight.data = q_w.contiguous().view(w.shape[0], w.shape[1]).type(dtype)
+
+                quantizers['model.layers.%d.%s' % (i, name)] = (s.cpu(), mu.cpu())
+
+                del s
+                del mu
 
         layers[i] = layer.cpu()
         del layer
-        del gptq
         torch.cuda.empty_cache()
 
-        inps, outs = outs, inps
         print('+------------------+--------------+------------+-----------+-------+')
         print('\n')
 
-    if args.observe:
-        observer.print()
-        conditions = gen_conditions(args.wbits, args.groupsize)
-        for item in observer.items():
-            name = item[0]
-            layerid = item[1]
-            gptq = item[2]['gptq']
-            error = item[2]['error']
-            target = error / 2
-
-            table = Texttable()
-            table.header(['wbits', 'groupsize', 'error'])
-            table.set_cols_dtype(['i', 'i', 'f'])
-            table.add_row([args.wbits, args.groupsize, error])
-
-            print('Optimizing {} {} ..'.format(name, layerid))
-            for wbits, groupsize in conditions:
-
-                if error < target:
-                    # if error dropped 50%, skip
-                    break
-
-                gptq.quantizer.configure(wbits, perchannel=True, sym=args.sym, mse=False)
-
-                scale, zero, g_idx, error = gptq.fasterquant(percdamp=args.percdamp, groupsize=groupsize, actorder=args.act_order, name=name)
-
-                table.add_row([wbits, groupsize, error])
-                quantizers['model.layers.%d.%s' % (layerid, name)] = (gptq.quantizer.cpu(), scale.cpu(), zero.cpu(), g_idx.cpu(), wbits, groupsize)
-
-            print(table.draw())
-            print('\n')
-            gptq.layer.to('cpu')
-            gptq.free()
-
-    model.config.use_cache = use_cache
-
     return quantizers
-
 
 @torch.no_grad()
 def llama_eval(model, testenc, dev):
@@ -236,16 +285,6 @@ def llama_eval(model, testenc, dev):
 
     for i in tqdm(range(len(layers))):
         layer = layers[i].to(dev)
-
-        if args.nearest:
-            subset = find_layers(layer)
-            for name in subset:
-                quantizer = quant.Quantizer()
-                wbits = args.attn_wbits if 'attn' in name else args.mlp_wbits
-                quantizer.configure(wbits, perchannel=True, sym=args.sym, mse=False)
-                W = subset[name].weight.data
-                quantizer.find_params(W, weight=True)
-                subset[name].weight.data = quantizer.quantize(W).to(next(iter(layer.parameters())).dtype)
 
         for j in range(nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
@@ -466,10 +505,10 @@ if __name__ == '__main__':
     parser.add_argument('dataset', type=str, choices=['wikitext2', 'ptb', 'c4'], help='Where to extract calibration data from.')
     parser.add_argument('--seed', type=int, default=0, help='Seed for sampling the calibration data.')
     parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration data samples.')
-    parser.add_argument('--attn_m', type=int, default=8, help='mantissa bits for attn')
     parser.add_argument('--attn_e', type=int, default=0, help='exponent bist for attn')
-    parser.add_argument('--mlp_m', type=int, default=2, help='mantissa bits for mlp')
+    parser.add_argument('--attn_m', type=int, default=8, help='mantissa bits for attn')
     parser.add_argument('--mlp_e', type=int, default=0, help='exponent bits for mlp')
+    parser.add_argument('--mlp_m', type=int, default=2, help='mantissa bits for mlp')
 
     parser.add_argument('--block_size', type=int, default=128, help='block size for the quantization')
     parser.add_argument('--eval', action='store_true', help='evaluate quantized model.')
@@ -486,6 +525,13 @@ if __name__ == '__main__':
     parser.add_argument('--exp_name', type=str, default='debug_thread', help='name of the eperiment')
     parser.add_argument('--parent_dir', type=str, default='llama3-8B', help='parent directory to store the results')
     parser.add_argument('--seqlen', type=int, default=8192, help='context length of the model')
+
+    parser.add_argument('--start_learning_rate', type=float, default=0.001, help='learning rate for learning s, mu')
+    parser.add_argument('--s_eps', type=float, default=1e-5, help='smallest scale to prevent it from going to negative')
+    parser.add_argument('--num_epochs', type=int, default=100, help='number of epochs for learning s, mu')
+    parser.add_argument('--ridge_lambda', type=float, default=0.001, help='ridge lambda for computing quant error')
+    parser.add_argument('--barrier_nu', type=float, default=0.001, help='barrier nu for computing quant error')
+    parser.add_argument('--support_special_values', action='store_true', help='Whether to support special values during quantization or not')
 
     args = parser.parse_args()
 
@@ -510,10 +556,8 @@ if __name__ == '__main__':
         model.eval()
 
     if not args.load and (args.attn_m < 16 or args.mlp_m < 16):
-        dataloader, testloader = get_loaders(args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen)
-
         tick = time.time()
-        quantizers = llama_sequential(model, dataloader, DEV)
+        quantizers = llama_sequential(model, DEV)
         print(time.time() - tick)
 
     if args.benchmark:
@@ -564,7 +608,7 @@ if __name__ == '__main__':
     if args.quant_directory is not None:
         export_quant_table(quantizers, args.quant_directory)
 
-    if not args.observe and args.save:
+    if args.save:
         os.makedirs(exp_dir, exist_ok=True)
 
         torch.save(model.state_dict(), os.path.join(exp_dir, 'fakequant_model.pt') )
@@ -573,7 +617,8 @@ if __name__ == '__main__':
             json.dump(args.__dict__, h, indent = 6)
 
         # save the packed model
-        llama_pack(model, quantizers, args.attn_wbits, args.mlp_wbits, args.groupsize)
+        # TODO- packing need to be handled
+        # llama_pack(model, quantizers, args.attn_wbits, args.mlp_wbits, args.groupsize)
         torch.save(model.state_dict(), os.path.join(exp_dir, 'packed_model.pt') )
 
     if not args.observe and args.save_safetensors:
