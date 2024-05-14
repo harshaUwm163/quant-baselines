@@ -16,6 +16,8 @@ import csv
 from tqdm import tqdm
 import json
 
+import logging
+
 
 def get_llama(model, seqlen=8192):
 
@@ -82,6 +84,8 @@ def find_scale_mu_fp(  layer,
     
         errs.append(loss.item())
         pbar.set_description(f'{name}, loss = {loss.item():.5f}')
+
+    logging.info(f'{name} : final_loss = {loss.item():.5f}')
 
     final_s, final_mu = s.detach(), mu.detach()
 
@@ -540,6 +544,13 @@ if __name__ == '__main__':
     args.exp_name = f'{args.exp_name}_'+datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
     exp_dir = os.path.join(results_dir, args.exp_name)
 
+    os.makedirs(exp_dir, exist_ok=True)
+    logfile = os.path.join(exp_dir, 'log.log')
+    logging.basicConfig(filename=logfile, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    for k,v in args.__dict__.items():
+        logging.info(f'{k = } {v}')
+
     # print args
     for k,v in args.__dict__.items(): print(k, ':', v)
 
@@ -580,6 +591,9 @@ if __name__ == '__main__':
             print(dataset)
             ppl = llama_eval(model, testloader, DEV)
             ppls.append(ppl)
+
+            logging.info(f'ppl on {dataset}: {ppl}')
+
 
         end_time = time.time()
         elapsed_time = (end_time - start_time)
