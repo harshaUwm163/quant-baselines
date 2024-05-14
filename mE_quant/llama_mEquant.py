@@ -119,10 +119,10 @@ def find_scale_mu_fi(  layer,
     w = layer.weight.data.clone()
     BLOCK = block_size
 
-    b_w = w.reshape((w.shape[0]//BLOCK, BLOCK, w.shape[1]))
+    b_w = w.reshape((w.shape[1]//BLOCK, w.shape[0], BLOCK))
 
-    bw_max = torch.max(b_w, axis=1, keepdim=True)[0]
-    bw_min = torch.min(b_w, axis=1, keepdim=True)[0]
+    bw_max = torch.max(b_w, axis=2, keepdim=True)[0]
+    bw_min = torch.min(b_w, axis=2, keepdim=True)[0]
     
     s = torch.nn.Parameter((bw_max - bw_min) / 2.0 / fi_max(m_bit))
     mu = torch.nn.Parameter((bw_max + bw_min) / 2.0)
@@ -142,6 +142,8 @@ def find_scale_mu_fi(  layer,
     
         errs.append(loss.item())
         pbar.set_description(f'{name}, loss = {loss.item():.5f}')
+
+    logging.info(f'{name} : final_loss = {loss.item():.5f}')
 
     final_s, final_mu = s.detach(), mu.detach()
 
@@ -209,7 +211,7 @@ def llama_sequential(model, dev):
 
                     w = subset[name].weight.data.clone().type(torch.float32)
                     BLOCK = args.block_size
-                    b_w = w.reshape((w.shape[0]//BLOCK, BLOCK, w.shape[1]))
+                    b_w = w.reshape((w.shape[1]//BLOCK, w.shape[0], BLOCK))
 
                     # q_w = fp_round(     b_w,
                     #                     s.expand(-1, b_w.shape[1], -1),
