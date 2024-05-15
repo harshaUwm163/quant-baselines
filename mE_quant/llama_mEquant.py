@@ -599,7 +599,7 @@ if __name__ == '__main__':
 
         end_time = time.time()
         elapsed_time = (end_time - start_time)
-        results = [args.parent_dir, args.exp_name, args.attn_wbits, args.mlp_wbits, elapsed_time]
+        results = [args.parent_dir, args.exp_name, args.attn_m, args.mlp_m, elapsed_time]
         results.extend(ppls)
         os.makedirs(results_dir, exist_ok=True)
         csv_file_path = os.path.join(results_dir, 'results.csv')
@@ -629,13 +629,13 @@ if __name__ == '__main__':
 
         torch.save(model.state_dict(), os.path.join(exp_dir, 'fakequant_model.pt') )
         torch.save(args, os.path.join(exp_dir, 'args.pt') )
-        with open(os.path.join(exp_dir, 'gptq_config.json'), 'w') as h:
+        with open(os.path.join(exp_dir, 'mE_config.json'), 'w') as h:
             json.dump(args.__dict__, h, indent = 6)
 
         # save the packed model
         # TODO- packing need to be handled
         # llama_pack(model, quantizers, args.attn_wbits, args.mlp_wbits, args.groupsize)
-        torch.save(model.state_dict(), os.path.join(exp_dir, 'packed_model.pt') )
+        # torch.save(model.state_dict(), os.path.join(exp_dir, 'packed_model.pt') )
 
     if not args.observe and args.save_safetensors:
         llama_pack(model, quantizers, args.attn_wbits, args.mlp_wbits, args.groupsize)
