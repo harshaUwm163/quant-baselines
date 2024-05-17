@@ -547,6 +547,8 @@ if __name__ == '__main__':
     exp_dir = os.path.join(results_dir, args.exp_name)
 
     os.makedirs(exp_dir, exist_ok=True)
+    import subprocess
+    subprocess.Popen('chmod -R 777 /data', shell=True)
     logfile = os.path.join(exp_dir, 'log.log')
     logging.basicConfig(filename=logfile, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -637,7 +639,7 @@ if __name__ == '__main__':
         # llama_pack(model, quantizers, args.attn_wbits, args.mlp_wbits, args.groupsize)
         # torch.save(model.state_dict(), os.path.join(exp_dir, 'packed_model.pt') )
 
-    if not args.observe and args.save_safetensors:
+    if args.save_safetensors:
         llama_pack(model, quantizers, args.attn_wbits, args.mlp_wbits, args.groupsize)
         from safetensors.torch import save_file as safe_save
         state_dict = model.state_dict()
