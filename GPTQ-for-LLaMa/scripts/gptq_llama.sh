@@ -8,8 +8,8 @@ python llama.py /data/$llama_model \
                 --mlp_wbits "$2" \
                 --true-sequential \
                 --act-order \
-                --parent_dir $llama_model \
                 --groupsize 128 \
+                --parent_dir $llama_model \
                 --exp_name gptq"$1""$2"_act_g128 \
                 --seqlen 8192
 

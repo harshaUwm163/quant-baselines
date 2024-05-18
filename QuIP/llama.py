@@ -16,9 +16,13 @@ from bal import Balance
 from near import Nearest
 
 from tqdm import tqdm
+import os
+from datetime import datetime
+import csv
+import json
 
 
-def get_llama(model):
+def get_llama(model, seqlen):
 
     def skip(*args, **kwargs):
         pass
@@ -28,7 +32,7 @@ def get_llama(model):
     torch.nn.init.normal_ = skip
     from transformers import LlamaForCausalLM
     model = LlamaForCausalLM.from_pretrained(model, torch_dtype=torch.float16)
-    model.seqlen = 2048
+    model.seqlen = seqlen
     #model.seqlen = 4096
     return model
 
@@ -88,10 +92,11 @@ def llama_sequential(model, dataloader, dev):
         # Initialize Quant Method and Çompute H
         quant_method = {}
         for name in subset:
+            wbits = args.attn_wbits if 'attn' in name else args.mlp_wbits
             if args.quant == 'gptq':
                 quant_method[name] = GPTQ(subset[name])
                 quant_method[name].quantizer = Quantizer()
-                quant_method[name].quantizer.configure(args.wbits,
+                quant_method[name].quantizer.configure(wbits,
                                                perchannel=True,
                                                sym=False,
                                                qfn=args.qfn,
@@ -99,7 +104,7 @@ def llama_sequential(model, dataloader, dev):
             elif args.quant == 'nearest':
                 quant_method[name] = Nearest(subset[name])
                 quant_method[name].quantizer = Quantizer()
-                quant_method[name].quantizer.configure(args.wbits,
+                quant_method[name].quantizer.configure(wbits,
                                                perchannel=True,
                                                sym=False,
                                                qfn=args.qfn,
@@ -109,12 +114,11 @@ def llama_sequential(model, dataloader, dev):
                 quant_method[name] = Balance(subset[name])
                 quant_method[name].configure(
                                     args.quant,
-                                    args.wbits, 
-                                    args.qbits, 
+                                    wbits, 
                                     args.npasses,
                                     unbiased=args.unbiased)
                 quant_method[name].quantizer = Quantizer()
-                quant_method[name].quantizer.configure(args.wbits,
+                quant_method[name].quantizer.configure(wbits,
                                                perchannel=True,
                                                sym=False,
                                                qfn=args.qfn,
@@ -219,8 +223,7 @@ def llama_eval(model, testenc, dev):
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
 
-    for i in range(len(layers)):
-        print(i)
+    for i in tqdm(range(len(layers))):
         layer = layers[i].to(dev)
 
         for j in range(nsamples):
@@ -252,11 +255,13 @@ def llama_eval(model, testenc, dev):
 
     model.config.use_cache = use_cache
 
+    return ppl.item()
 
-def llama_pack(model, quantizers, wbits, groupsize):
+
+def llama_pack(model, quantizers, attn_wbits, mlp_wbits, groupsize):
     layers = find_layers(model)
     layers = {n: layers[n] for n in quantizers}
-    quant.make_quant_linear(model, quantizers, wbits, groupsize)
+    quant.make_quant_linear(model, quantizers, attn_wbits, mlp_wbits, groupsize)
     qlayers = find_layers(model, [quant.QuantLinear])
     print('Packing ...')
     for name in qlayers:
@@ -268,7 +273,7 @@ def llama_pack(model, quantizers, wbits, groupsize):
 
 
 # original includes fast inference
-def load_quant_original(model, checkpoint, wbits, groupsize=-1, fused_mlp=True, eval=True, warmup_autotune=True):
+def load_quant_original(model, checkpoint, attn_wbits, mlp_wbits, groupsize=-1, fused_mlp=True, eval=True, warmup_autotune=True):
     from transformers import LlamaConfig, LlamaForCausalLM, modeling_utils
     config = LlamaConfig.from_pretrained(model)
 
@@ -290,7 +295,7 @@ def load_quant_original(model, checkpoint, wbits, groupsize=-1, fused_mlp=True, 
     for name in ['lm_head']:
         if name in layers:
             del layers[name]
-    quant.make_quant_linear(model, layers, wbits, groupsize)
+    quant.make_quant_linear(model, layers, attn_wbits, mlp_wbits, groupsize)
 
     del layers
 
@@ -319,7 +324,7 @@ def load_quant_original(model, checkpoint, wbits, groupsize=-1, fused_mlp=True, 
 
 
 # slow inference, just to get perplexity/accuracy
-def load_quant(model, checkpoint, wbits, groupsize=-1, eval=True):
+def load_quant(model, checkpoint, attn_wbits, mlp_wbits, groupsize=-1, eval=True):
     from transformers import LlamaConfig, LlamaForCausalLM, modeling_utils
     config = LlamaConfig.from_pretrained(model)
 
@@ -473,6 +478,8 @@ def benchmark(model, input_ids, check=False):
 
 if __name__ == '__main__':
 
+    start_time = time.time()
+
     parser = argparse.ArgumentParser()
 
     # Added arguments for integration with QuIP
@@ -481,6 +488,15 @@ if __name__ == '__main__':
                         'ldlq', 'ldlqRG', 'ldlqRG_block', 'ldlbal_admm', 'nearest', 'gptq', 'gptq_updown'],
                         default='nearest',
                         help='Which quantization method to use.')
+    # from opt.py
+    parser.add_argument(
+        '--incoh_processing',
+        action='store_true',
+        help='incoherence processing')
+    parser.add_argument(
+        '--unbiased',
+        action='store_true',
+        help='unbiased')
     parser.add_argument('--pre_gptqH', action='store_true',help='preprocessing')
     parser.add_argument('--pre_rescale', action='store_true', help='preprocessing')
     parser.add_argument('--pre_proj', action='store_true', help='preprocessing')
@@ -493,7 +509,8 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=0, help='Seed for sampling the calibration data.')
     parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration data samples.')
     parser.add_argument('--percdamp', type=float, default=.01, help='Percent of the average Hessian diagonal to use for dampening.')
-    parser.add_argument('--wbits', type=int, default=16, choices=[2, 3, 4, 8, 16], help='#bits to use for quantization; use 16 for evaluating base model.')
+    parser.add_argument('--attn_wbits', type=int, default=16, help='#bits to use for quantization of attn; use 16 for evaluating base model.')
+    parser.add_argument('--mlp_wbits', type=int, default=16, help='#bits to use for quantization of mlp; use 16 for evaluating base model.')
     parser.add_argument('--groupsize', type=int, default=-1, help='Groupsize to use for quantization; default uses full row.')
     parser.add_argument('--eval', action='store_true', help='evaluate quantized model.')
     parser.add_argument('--test-generation', action='store_true', help='test generation.')
@@ -504,7 +521,25 @@ if __name__ == '__main__':
     parser.add_argument('--new-eval', action='store_true', help='Whether to use the new PTB and C4 eval')
     parser.add_argument('--layers-dist', type=str, default='', help='Distribution of layers across GPUs. e.g. 2:1:1 for 2 layers on GPU 0, 1 layer on GPU 1, and 1 layer on GPU 2. Any remaining layers will be assigned to your last GPU.')
 
+    parser.add_argument('--exp_name', type=str, default='debug_thread', help='name of the eperiment')
+    parser.add_argument('--parent_dir', type=str, default='llama3-8B', help='parent directory to store the results')
+    parser.add_argument('--seqlen', type=int, default=8192, help='context length of the model')
+
     args = parser.parse_args()
+    if args.incoh_processing:
+        args.pre_gptqH   = True
+        args.pre_rescale = True
+        args.pre_proj    = True
+        args.proj_extra  = 1
+        args.qfn         = 'b'
+
+    results_dir = f'/data/llama3_felix_results/'
+    results_dir = os.path.join(results_dir, args.parent_dir)
+    args.exp_name = f'{args.exp_name}_'+datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
+    exp_dir = os.path.join(results_dir, args.exp_name)
+
+    # print args
+    for k,v in args.__dict__.items(): print(k, ':', v)
 
     if args.layers_dist:
         gpu_dist = [int(x) for x in args.layers_dist.split(':')]
@@ -515,17 +550,18 @@ if __name__ == '__main__':
         args.load = args.load.as_posix()
 
     if args.load:
-        model = load_quant(args.model, args.load, args.wbits, args.groupsize)
+        model = load_quant(args.model, args.load, args.attn_wbits, args.mlp_wbits, args.groupsize)
     else:
-        model = get_llama(args.model)
+        model = get_llama(args.model, seqlen=args.seqlen)
         model.eval()
 
     dataloader, testloader = get_loaders(args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen)
 
-    if not args.load and args.wbits < 16:
+    if not args.load and (args.mlp_wbits < 16 or args.attn_wbits < 16):
         tick = time.time()
         quantizers = llama_sequential(model, dataloader, DEV)
-        print(time.time() - tick)
+        quant_time = time.time() - tick
+        print(quant_time)
 
     # if args.benchmark:
     #     gpus = [torch.device('cuda:%d' % i) for i in range(torch.cuda.device_count())]
@@ -538,14 +574,25 @@ if __name__ == '__main__':
     #         benchmark(model, input_ids, check=args.check)
 
     if args.eval:
+        ppls = []
         datasets = ['wikitext2', 'ptb', 'c4']
         if args.new_eval:
             datasets = ['wikitext2', 'ptb-new', 'c4-new']
-            datasets = ['c4-new']
         for dataset in datasets:
             dataloader, testloader = get_loaders(dataset, seed=args.seed, model=args.model, seqlen=model.seqlen)
             print(dataset)
-            llama_eval(model, testloader, DEV)
+            ppl = llama_eval(model, testloader, DEV)
+            ppls.append(ppl)
+
+        end_time = time.time()
+        elapsed_time = (end_time - start_time)
+        results = [args.parent_dir, args.exp_name, args.attn_wbits, args.mlp_wbits, elapsed_time]
+        results.extend(ppls)
+        os.makedirs(results_dir, exist_ok=True)
+        csv_file_path = os.path.join(results_dir, 'results.csv')
+        with open(csv_file_path, mode='a', newline='') as handle:
+            writer = csv.writer(handle)
+            writer.writerow(results)
     
     if args.test_generation:
         gpus = [torch.device('cuda:%d' % i) for i in range(torch.cuda.device_count())]
@@ -566,7 +613,18 @@ if __name__ == '__main__':
 
     if args.save:
         # llama_pack(model, quantizers, args.wbits, args.groupsize)
-        torch.save(model.state_dict(), args.save)
+        # torch.save(model.state_dict(), args.save)
+
+        os.makedirs(exp_dir, exist_ok=True)
+
+        torch.save(model.state_dict(), os.path.join(exp_dir, 'fakequant_model.pt') )
+        torch.save(args, os.path.join(exp_dir, 'args.pt') )
+        with open(os.path.join(exp_dir, 'gptq_config.json'), 'w') as h:
+            json.dump(args.__dict__, h, indent = 6)
+
+        # save the packed model
+        llama_pack(model, quantizers, args.attn_wbits, args.mlp_wbits, args.groupsize)
+        torch.save(model.state_dict(), os.path.join(exp_dir, 'packed_model.pt') )
 
     # if args.save_safetensors:
     #     llama_pack(model, quantizers, args.wbits, args.groupsize)
